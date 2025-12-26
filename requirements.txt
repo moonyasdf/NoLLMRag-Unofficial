@@ -1,0 +1,8 @@
+igraph>=0.10.0
+spacy>=3.7.0
+sentence-transformers>=2.2.0
+faiss-cpu>=1.7.0
+leidenalg>=0.10.0
+numpy>=1.24.0
+requests
+tqdm
