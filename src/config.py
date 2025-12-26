@@ -2,6 +2,13 @@ import os
 import multiprocessing
 
 class Config:
+    # --- Experiment Modes ---
+    # Options: "text" (original words) or "lemma" (dictionary form)
+    TOKEN_MODE = "text" 
+    
+    # Options: "union" (broad search) or "intersection" (strict paper Algorithm 1)
+    RETRIEVAL_MODE = "union" 
+    
     # --- Paper Hyperparameters ---
     CHUNK_SIZE = 100         
     KEYWORD_TAU = 0.2        
