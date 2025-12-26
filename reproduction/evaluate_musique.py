@@ -1,10 +1,14 @@
 import sys
 import os
 import logging
-from typing import List, Dict
+import json
+import re
+from typing import List, Dict, Any
 
-# Añadir el directorio raíz al path para poder importar 'src'
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+# Fix para importaciones en Colab/Entornos con path raíz variable
+current_path = os.getcwd()
+if current_path not in sys.path:
+    sys.path.append(current_path)
 
 from src.pipeline import NoLLMRAGPipeline
 from reproduction.musique_loader import MusiqueLoader
@@ -16,21 +20,28 @@ class MusiqueEvaluator:
     def __init__(self, pipeline: NoLLMRAGPipeline):
         self.pipeline = pipeline
 
+    def _normalize(self, text: str) -> str:
+        """Elimina espacios, caracteres especiales y normaliza a minúsculas para matching robusto."""
+        return re.sub(r'[^a-z0-9]', '', text.lower())
+
     def run(self, questions_path: str, k_values: List[int] = [1, 5, 10, 30]):
-        questions = MusiqueLoader.load_questions(questions_path)
+        if not os.path.exists(questions_path):
+            logger.error(f"Questions file not found: {questions_path}")
+            return
+
+        with open(questions_path, 'r', encoding='utf-8') as f:
+            questions = json.load(f)
         
         results = []
         logger.info(f"Starting evaluation of {len(questions)} queries...")
 
         for i, q_item in enumerate(questions):
             query = q_item['question']
-            # Chunks de oro (los que contienen la respuesta)
             gold_chunks = [p['paragraph_text'] for p in q_item['paragraphs'] if p['is_supporting']]
             
-            # Ejecutar retrieval puro (sin LLM)
+            # Retrieval puro
             retrieved = self.pipeline.retrieve_only(query)
             
-            # Métricas por query
             metrics = self._calculate_metrics(gold_chunks, retrieved, k_values)
             results.append(metrics)
             
@@ -41,26 +52,23 @@ class MusiqueEvaluator:
 
     def _calculate_metrics(self, gold_chunks: List[str], retrieved: List[str], k_values: List[int]) -> Dict:
         query_res = {}
+        # Normalizamos los gold chunks de antemano
+        gold_normalized = [self._normalize(g[:100]) for g in gold_chunks]
+        
         for k in k_values:
             top_k = retrieved[:k]
+            top_k_normalized = [self._normalize(r) for r in top_k]
+            
             hits = 0
-            for gold in gold_chunks:
-                # Normalización mínima para comparación
-                gold_clean = gold[:100].lower()
-                if any(gold_clean in r.lower() for r in top_k):
+            for gn in gold_normalized:
+                if any(gn in rn for rn in top_k_normalized):
                     hits += 1
             
-            # Recall: ¿Cuántos de los necesarios encontramos?
             recall = hits / len(gold_chunks) if gold_chunks else 0
-            
-            # Noise Ratio: ¿Cuánta basura hay en lo recuperado?
-            # (Documentos recuperados que no son útiles / Total recuperado)
             noise_ratio = (len(top_k) - hits) / len(top_k) if top_k else 1.0
             
             query_res[f"Recall@{k}"] = recall
             query_res[f"Noise@{k}"] = noise_ratio
-            
-            # Métrica Multi-hop Crítica: ¿Encontramos TODOS los saltos?
             query_res[f"FullSuccess@{k}"] = 1.0 if hits == len(gold_chunks) else 0.0
             
         return query_res
@@ -79,22 +87,21 @@ class MusiqueEvaluator:
             print(f"K = {k}:")
             print(f"  - Avg Recall:      {avg_recall:.2%}")
             print(f"  - Avg Noise Ratio: {avg_noise:.2%}")
-            print(f"  - Full Hop Success: {avg_success:.2%}") # ¿Encontró los 4 docs?
+            print(f"  - Full Hop Success: {avg_success:.2%}")
             print("-" * 20)
 
 if __name__ == "__main__":
-    # Rutas relativas
+    # Ajusta estas rutas a tu entorno de Colab
     CORPUS = "./data/musique_corpus.json"
     QUESTIONS = "./data/musique_4hop_questions.json"
 
     rag = NoLLMRAGPipeline()
     
-    # 1. Indexación (Si el grafo está vacío)
     if not rag.ge.graph.vcount():
         logger.info("Index empty. Building from corpus...")
+        from reproduction.musique_loader import MusiqueLoader
         docs = MusiqueLoader.load_corpus(CORPUS)
         rag.index(docs)
     
-    # 2. Evaluación
     evaluator = MusiqueEvaluator(rag)
     evaluator.run(QUESTIONS)
