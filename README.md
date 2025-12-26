@@ -1,6 +1,6 @@
 # NoLLMRAG: Unofficial Optimized Implementation & Benchmarking
 
-This repository contains a high-performance implementation of the NoLLMRAG framework, optimized for large-scale datasets and evaluated against the MuSiQue 4-hop reasoning benchmark.
+This repository contains a unofficial implementation of the [NoLLMRAG framework](https://openreview.net/forum?id=KIUOtEKzzN), optimized for large-scale datasets and evaluated against the MuSiQue 4-hop reasoning benchmark.
 
 ## Project Scope
 The goal was to implement the 3-layer heterogeneous graph index described in the NoLLMRAG paper and evaluate its retrieval capabilities in deep multi-hop scenarios (4 jumps) without using LLMs for indexing or retrieval logic.
