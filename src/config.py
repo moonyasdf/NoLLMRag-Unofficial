@@ -4,11 +4,10 @@ import multiprocessing
 class Config:
     # --- Paper Hyperparameters ---
     CHUNK_SIZE = 100         
-    KEYWORD_TAU = 0.5        
+    KEYWORD_TAU = 0.2        
     TOP_K_CHUNKS = 30        
     
     # --- System Settings ---
-    # Batch size for both SpaCy and Embeddings (CPU friendly default)
     BATCH_SIZE = 200 
     
     # --- Models ---
@@ -22,9 +21,9 @@ class Config:
     except NotImplementedError:
         NUM_PROCESSES = 1
         
-    # --- Paths ---
-    BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    DATA_DIR = os.path.join(BASE_DIR, "data", "indices")
+    # --- Local Colab Paths (SSD) ---
+    BASE_DIR = "/content/NoLLMRAG_Local"
+    DATA_DIR = os.path.join(BASE_DIR, "indices")
     
     GRAPH_PATH = os.path.join(DATA_DIR, "graph.pkl")
     VEC_TOKEN_PATH = os.path.join(DATA_DIR, "token_index.faiss")
