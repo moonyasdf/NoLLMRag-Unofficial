@@ -8,7 +8,6 @@ from collections import defaultdict
 from typing import List, Tuple, Dict, Set, Any
 from .config import Config
 
-# Configurar logger
 logger = logging.getLogger(__name__)
 
 class GraphEngine:
@@ -24,30 +23,25 @@ class GraphEngine:
         return self._token_start_id
 
     def build(self, documents: List[str], processor: Any) -> Tuple[List[str], List[str]]:
-        """
-        Construcción de alto rendimiento del grafo de 3 capas (Docs, Chunks, Tokens).
-        Optimizado con NumPy y procesamiento por lotes.
-        """
+        """Vectorized construction of the 3-layer heterogeneous graph."""
         if not documents:
-            raise ValueError("La lista de documentos está vacía.")
+            raise ValueError("Document list is empty.")
 
-        logger.info(f"Iniciando indexación de {len(documents)} documentos...")
+        logger.info(f"Indexing {len(documents)} documents using mode: {Config.TOKEN_MODE}")
         
         corpus_data = []
         unique_tokens = set()
         temp_chunk_list = []
         
-        logger.info("Fase 1: Segmentación de texto...")
+        # Phase 1: Segmentation
         for doc_id, doc_text in enumerate(documents):
             chunks = processor.segment_text(doc_text)
             for chunk in chunks:
                 temp_chunk_list.append((doc_id, chunk))
         
         chunk_texts = [x[1] for x in temp_chunk_list]
-        total_chunks = len(chunk_texts)
         
-        logger.info(f"Fase 2: Procesando {total_chunks} chunks en paralelo (batch_size={Config.BATCH_SIZE})...")
-        
+        # Phase 2: Parallel NLP Processing
         processed_chunks = list(processor.nlp.pipe(
             chunk_texts, 
             batch_size=Config.BATCH_SIZE, 
@@ -56,102 +50,65 @@ class GraphEngine:
         
         for i, spacy_doc in enumerate(processed_chunks):
             doc_id, original_text = temp_chunk_list[i]
-            # Extraemos tokens (NoLLMRAG usa lemas en el paper, pero aquí usamos texto por robustez)
-            tokens_seq = [
-                t.text for t in spacy_doc 
-                if t.is_alpha and not t.is_stop and len(t.text) > 1
-            ]
-            corpus_data.append({
-                'doc_id': doc_id,
-                'chunk_text': original_text,
-                'tokens': tokens_seq
-            })
+            # Use Config-dependent tokenization (text vs lemma)
+            if Config.TOKEN_MODE == "lemma":
+                tokens_seq = [t.lemma_ for t in spacy_doc if t.is_alpha and not t.is_stop and len(t.text) > 1]
+            else:
+                tokens_seq = [t.text for t in spacy_doc if t.is_alpha and not t.is_stop and len(t.text) > 1]
+                
+            corpus_data.append({'doc_id': doc_id, 'chunk_text': original_text, 'tokens': tokens_seq})
             unique_tokens.update(tokens_seq)
 
         sorted_tokens = sorted(list(unique_tokens))
-        
-        num_docs = len(documents)
-        num_chunks = len(corpus_data)
-        num_tokens = len(sorted_tokens)
-        
-        logger.info(f"Nodos creados: {num_docs} Docs, {num_chunks} Chunks, {num_tokens} Tokens")
+        num_docs, num_chunks, num_tokens = len(documents), len(corpus_data), len(sorted_tokens)
         
         chunk_start_id = num_docs
         token_start_id = num_docs + num_chunks
         self._token_start_id = token_start_id
-        
         self.vocab_map = {t: (token_start_id + i) for i, t in enumerate(sorted_tokens)}
         
-        logger.info("Fase 3: Generando aristas (E_DC, E_CT, E_TT)...")
-        
-        edges_dc = [] 
-        edges_ct = [] 
-        edges_tt = [] 
-        
-        self.chunk_data = {}
+        # Phase 3: Edge Generation
+        edges_dc, edges_ct, edges_tt = [], [], []
         doc_to_chunks_map = defaultdict(list)
         
         for c_idx, data in enumerate(corpus_data):
             c_real_id = chunk_start_id + c_idx
             self.chunk_data[c_real_id] = data['chunk_text']
-            
-            # E_DC: Documento -> Chunk
             edges_dc.append((data['doc_id'], c_real_id))
-            
             t_ids = [self.vocab_map[t] for t in data['tokens']]
             doc_to_chunks_map[data['doc_id']].append((c_real_id, t_ids))
-            
-            if not t_ids: continue
-            
-            # E_CT: Chunk <-> Token
             for tid in set(t_ids):
                 edges_ct.append((c_real_id, tid))
         
-        # E_TT: Token -> Token (Continuidad sintáctica)
+        # Vectorized E_TT
         for doc_id in range(num_docs):
             chunks = doc_to_chunks_map[doc_id]
             if not chunks: continue
-            
-            full_doc_sequence = []
-            for _, t_ids in chunks:
-                full_doc_sequence.extend(t_ids)
-            
-            if len(full_doc_sequence) < 2: continue
-            
-            arr = np.array(full_doc_sequence, dtype=np.int32)
-            sources = arr[:-1]
-            targets = arr[1:]
-            pairs = np.column_stack((sources, targets))
+            full_seq = []
+            for _, t_ids in chunks: full_seq.extend(t_ids)
+            if len(full_seq) < 2: continue
+            arr = np.array(full_seq, dtype=np.int32)
+            pairs = np.column_stack((arr[:-1], arr[1:]))
             edges_tt.extend(map(tuple, pairs))
 
-        # Construcción final en igraph
+        # Phase 4: Graph Assembly
         self.graph = ig.Graph(directed=True)
         self.graph.add_vertices(num_docs + num_chunks + num_tokens)
-        
         self.graph.vs[0:num_docs]["type"] = "document"
         self.graph.vs[chunk_start_id:token_start_id]["type"] = "chunk"
         self.graph.vs[token_start_id:]["type"] = "token"
         self.graph.vs[token_start_id:]["label"] = sorted_tokens
         
-        count_dc, count_ct, count_tt = len(edges_dc), len(edges_ct), len(edges_tt)
         self.graph.add_edges(edges_dc + edges_ct + edges_tt)
-        
-        types = np.concatenate([
-            np.zeros(count_dc, dtype=int),
-            np.ones(count_ct, dtype=int),
-            np.full(count_tt, 2, dtype=int)
-        ])
+        types = np.concatenate([np.zeros(len(edges_dc)), np.ones(len(edges_ct)), np.full(len(edges_tt), 2)])
         self.graph.es["type"] = types
-        self.total_ETT = count_tt
+        self.total_ETT = len(edges_tt)
         
-        logger.info(f"Grafo construido. Total aristas: {self.graph.ecount()}")
+        logger.info(f"Graph Built: {self.graph.vcount()} nodes, {self.graph.ecount()} edges.")
         return sorted_tokens, [self.chunk_data[k] for k in sorted(self.chunk_data.keys())]
 
     def calculate_importance_scores(self, query_token_ids: List[int]) -> Dict[int, float]:
-        """
-        Calcula IS (Importance Score) basado en IGTF, ICF y IDF.
-        Optimización: Eliminado el logaritmo exterior para mejorar la discriminación.
-        """
+        """Calculates token importance scores. Optimized logic (Single Log)."""
         scores = {}
         total_chunks = len(self.chunk_data)
         total_docs = len(self.graph.vs.select(type_eq="document"))
@@ -164,97 +121,99 @@ class GraphEngine:
             
             for eid in inc_edges:
                 edge = self.graph.es[eid]
-                etype = edge["type"]
-                if etype == 1: # E_CT
+                if edge["type"] == 1:
                     neighbor = edge.source if edge.target == tid else edge.target
-                    if self.graph.vs[neighbor]["type"] == "chunk":
-                        connected_chunks_ids.add(neighbor)
-                elif etype == 2: # E_TT
+                    if self.graph.vs[neighbor]["type"] == "chunk": connected_chunks_ids.add(neighbor)
+                elif edge["type"] == 2:
                     if edge.target == tid: in_degree_TT += 1
                     if edge.source == tid: out_degree_TT += 1
 
-            # ICF: Rareza en chunks
-            icf_val = np.log(total_chunks / (len(connected_chunks_ids) + 1) + 1)
-            
-            # IDF: Rareza en documentos
+            icf = np.log(total_chunks / (len(connected_chunks_ids) + 1) + 1)
             connected_docs = set()
-            if connected_chunks_ids:
-                for cid in connected_chunks_ids:
-                    chunk_edges = self.graph.incident(cid, mode="all")
-                    for ceid in chunk_edges:
-                         if self.graph.es[ceid]["type"] == 0:
-                             cedge = self.graph.es[ceid]
-                             doc_node = cedge.source if cedge.target == cid else cedge.target
-                             connected_docs.add(doc_node)
-            idf_val = np.log(total_docs / (len(connected_docs) + 1) + 1)
+            for cid in connected_chunks_ids:
+                for ceid in self.graph.incident(cid, mode="all"):
+                    if self.graph.es[ceid]["type"] == 0:
+                        e = self.graph.es[ceid]
+                        connected_docs.add(e.source if e.target == cid else e.target)
+            idf = np.log(total_docs / (len(connected_docs) + 1) + 1)
+            igtf = np.log((self.total_ETT / max(1, max(in_degree_TT, out_degree_TT))) + 1)
             
-            # IGTF: Rareza global en secuencias
-            max_deg = max(in_degree_TT, out_degree_TT)
-            if max_deg == 0: max_deg = 1
-            igtf_val = np.log((self.total_ETT / max_deg) + 1)
-            
-            # Score final sin el segundo logaritmo del paper
-            scores[tid] = igtf_val * icf_val * idf_val 
-            
+            # Resulting Importance Score
+            scores[tid] = igtf * icf * idf
         return scores
 
     def extract_keywords_and_cluster(self, query_token_ids: List[int]) -> Set[int]:
-        """
-        Identifica keywords y recupera chunks. 
-        MODO UNIÓN: Recupera todos los chunks que contienen las keywords importantes.
-        Este modo es más robusto para 4-hops que la intersección estricta del paper.
-        """
+        """Retrieves chunks based on selected Config.RETRIEVAL_MODE."""
         stats = self.calculate_importance_scores(query_token_ids)
         if not stats: return set()
         
         max_is = max(stats.values())
-        # Selección de keywords basada en el umbral TAU (configurado en 0.2)
         keywords = [tid for tid, score in stats.items() if score > Config.KEYWORD_TAU * max_is]
-        
-        if not keywords: 
-             # Fallback: si nada pasa el umbral, tomar los top 5
-             sorted_stats = sorted(stats.items(), key=lambda x: x[1], reverse=True)
-             keywords = [x[0] for x in sorted_stats[:5]]
-             if not keywords: return set()
+        if not keywords: keywords = [x[0] for x in sorted(stats.items(), key=lambda x: x[1], reverse=True)[:5]]
 
-        logger.debug(f"Keywords seleccionadas para búsqueda: {[self.graph.vs[k]['label'] for k in keywords]}")
+        # --- MODE 1: UNION (Optimized for Multi-hop) ---
+        if Config.RETRIEVAL_MODE == "union":
+            retrieved = set()
+            for k in keywords:
+                for eid in self.graph.incident(k, mode="all"):
+                    if self.graph.es[eid]["type"] == 1:
+                        edge = self.graph.es[eid]
+                        node = edge.source if edge.target == k else edge.target
+                        if self.graph.vs[node]["type"] == "chunk": retrieved.add(node)
+            return retrieved
 
-        # Recolectar vecinos (chunks conectados a estas keywords)
-        retrieved_chunk_ids = set()
+        # --- MODE 2: INTERSECTION (Strict Paper Algorithm 1) ---
+        # 1. Build Co-occurrence Subgraph
+        k_neighbors = {}
         for k in keywords:
-            inc = self.graph.incident(k, mode="all")
-            for eid in inc:
-                if self.graph.es[eid]["type"] == 1: # E_CT
-                    edge = self.graph.es[eid]
-                    neighbor = edge.source if edge.target == k else edge.target
-                    if self.graph.vs[neighbor]["type"] == "chunk":
-                        retrieved_chunk_ids.add(neighbor)
-            
-        return retrieved_chunk_ids
+            nodes = set()
+            for eid in self.graph.incident(k, mode="all"):
+                if self.graph.es[eid]["type"] == 1:
+                    e = self.graph.es[eid]
+                    nodes.add(e.source if e.target == k else e.target)
+            k_neighbors[k] = nodes
+
+        g_co = ig.Graph(len(keywords))
+        weights = []
+        for i in range(len(keywords)):
+            for j in range(i+1, len(keywords)):
+                w = len(k_neighbors[keywords[i]].intersection(k_neighbors[keywords[j]]))
+                if w > 0:
+                    g_co.add_edge(i, j)
+                    weights.append(w)
+        
+        # 2. Leiden Clustering
+        partition = leidenalg.find_partition(g_co, leidenalg.ModularityVertexPartition, weights=weights or None)
+        retrieved_final = set()
+        for cluster_indices in partition:
+            if weights: cluster_indices.sort(key=lambda idx: g_co.strength(idx, weights=weights), reverse=True)
+            cluster_tids = [keywords[i] for i in cluster_indices]
+            s_curr = k_neighbors[cluster_tids[0]]
+            s_inter = set()
+            union_prev = set()
+            for i in range(1, len(cluster_tids)):
+                next_chunks = k_neighbors[cluster_tids[i]]
+                intersection = s_curr.intersection(next_chunks)
+                if intersection: s_curr = intersection
+                else:
+                    overlap = next_chunks.intersection(union_prev)
+                    if overlap: s_inter.update(s_curr); union_prev.update(s_curr); s_curr = overlap
+                    else: s_inter.update(s_curr); union_prev.update(s_curr); s_curr = next_chunks
+            s_inter.update(s_curr)
+            retrieved_final.update(s_inter)
+        return retrieved_final
 
     def save(self):
-        logger.info(f"Guardando grafo en {Config.GRAPH_PATH}")
-        with open(Config.GRAPH_PATH, 'wb') as f:
-            pickle.dump(self.graph, f)
-        meta = {
-            'vocab': self.vocab_map, 
-            'chunks': self.chunk_data, 
-            'total_ETT': self.total_ETT, 
-            'token_start_id': self._token_start_id
-        }
-        with open(Config.METADATA_PATH, 'wb') as f:
-            pickle.dump(meta, f)
+        with open(Config.GRAPH_PATH, 'wb') as f: pickle.dump(self.graph, f)
+        meta = {'vocab': self.vocab_map, 'chunks': self.chunk_data, 'total_ETT': self.total_ETT, 'token_start_id': self._token_start_id}
+        with open(Config.METADATA_PATH, 'wb') as f: pickle.dump(meta, f)
             
     def load(self) -> bool:
         if os.path.exists(Config.GRAPH_PATH):
-            logger.info("Cargando grafo desde disco...")
-            with open(Config.GRAPH_PATH, 'rb') as f:
-                self.graph = pickle.load(f)
+            with open(Config.GRAPH_PATH, 'rb') as f: self.graph = pickle.load(f)
             with open(Config.METADATA_PATH, 'rb') as f:
                 data = pickle.load(f)
-                self.vocab_map = data['vocab']
-                self.chunk_data = data['chunks']
-                self.total_ETT = data.get('total_ETT', 0)
+                self.vocab_map, self.chunk_data, self.total_ETT = data['vocab'], data['chunks'], data['total_ETT']
                 self._token_start_id = data.get('token_start_id', 0)
             return True
         return False
